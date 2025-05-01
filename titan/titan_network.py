@@ -6,6 +6,16 @@ from typing import Dict, List, Tuple, Optional, Union, Any
 import copy
 from dataclasses import dataclass, field
 
+## TODO:
+##   1 - Update static emissions to be vested over an alternate schedule.  This
+##       means 2 additional features: 1) there is an initial unlock (could be 0)
+##       as well as a vesting schedule.  This is important for the Testnet Token Allocation
+##   2 - Enforce max-cap on deal emissions.  NOTE that we don't need to
+##       worry about deal rewards, because those are taken from the market
+##       and then given to the participants.  This means that essentially
+##       they are neutral from a circulating supply perspective, because they
+##       are taken from CS, and then given to the miners (still CS from protocol perspective)
+
 
 @dataclass
 class EmissionBucket:
@@ -81,6 +91,9 @@ class TitanSimulationConfig:
                 raise ValueError(f"Locking vector length ({len(self.locking_vector)}) must match simulation months ({self.simulation_months})")
             if np.any(self.locking_vector < 0):
                 raise ValueError("Locking vector cannot contain negative values")
+        else:
+            self.locking_vector = np.zeros(self.simulation_months)
+            
 
 
 class TitanTokenSimulation:
@@ -96,7 +109,7 @@ class TitanTokenSimulation:
             config: Configuration parameters for the simulation
         """
         self.config = copy.deepcopy(config)
-        self.months = np.arange(config.simulation_months)
+        self.simulation_months = np.arange(config.simulation_months)
         self.results = None
         
     def run(self, deals: List[Deal]) -> pd.DataFrame:
@@ -110,7 +123,7 @@ class TitanTokenSimulation:
             DataFrame containing simulation results over time
         """
         # Initialize the results dataframe with months as index
-        self.results = pd.DataFrame(index=self.months)
+        self.results = pd.DataFrame(index=self.simulation_months)
         self.results.index.name = 'Month'
         
         # Process fixed emissions for each bucket
@@ -121,9 +134,8 @@ class TitanTokenSimulation:
         for deal in deals:
             self._process_deal(deal)
             
-        # Process validator rewards if configured
-        if self.config.validator_total_rewards > 0 and self.config.validator_half_life_months > 0:
-            self._process_validator_rewards()
+        # Process validator rewards
+        self._process_validator_rewards()
         
         # Calculate cumulative emissions and total supply
         self._calculate_totals()
@@ -148,7 +160,7 @@ class TitanTokenSimulation:
         
         # Process monthly emissions
         emitted_so_far = bucket.initial_supply
-        for month in self.months[bucket.start_month:]:
+        for month in self.simulation_months[bucket.start_month:]:
             # Check if we've hit the cap
             if emitted_so_far >= bucket.cap or month >= (bucket.months_to_emit + bucket.start_month):
                 break
@@ -170,19 +182,18 @@ class TitanTokenSimulation:
         
         # Calculate total rewards for this deal
         total_rewards = self.config.delta * deal.value * geo_multiplier / self.config.beta
+        # TODO: ensure that this total_rewards stays under overall token supply.
         
         ##########################################################
         # Create deal emissions columns if they don't exist
-        deal_col = f"deal_emissions"
+        deal_inflationary_rewards_emissions = f"deal_emissions"
         # buyback_col = f"buybacks"
-        total_emissions_col = f"total_emissions"
+        total_emissions_col = f"total_dynamic_emissions"
         buyback_reduction_col = f"buyback_reduction"
         vested_buybacks_col = f"vested_buybacks"
         
-        if deal_col not in self.results.columns:
-            self.results[deal_col] = 0.0
-        # if buyback_col not in self.results.columns:
-        #     self.results[buyback_col] = 0.0
+        if deal_inflationary_rewards_emissions not in self.results.columns:
+            self.results[deal_inflationary_rewards_emissions] = 0.0
         if total_emissions_col not in self.results.columns:
             self.results[total_emissions_col] = 0.0
         if buyback_reduction_col not in self.results.columns:
@@ -191,20 +202,23 @@ class TitanTokenSimulation:
             self.results[vested_buybacks_col] = 0.0
         ##########################################################
         
+        ##########################################################
+        #### Compute the amount given to miners through buybacks associated with deals
         # Calculate total buyback amount
         buyback_amount = deal.value * self.config.buyback_portion
         buyback_tokens = buyback_amount / deal.token_price  # Convert dollar amount to tokens
-        vesting_period = min(self.config.buyback_vesting_months, len(self.months) - deal.start_month)
-        monthly_buyback = buyback_tokens / vesting_period
+        distribution_period = min(self.config.buyback_vesting_months, len(self.simulation_months) - deal.start_month)
+        buyback_monthly_distribution_amt = buyback_tokens / distribution_period
         self.results.loc[deal.start_month, buyback_reduction_col] += buyback_tokens
 
-        for month in range(deal.start_month, min(deal.start_month + vesting_period, len(self.months))):
-            self.results.loc[month, vested_buybacks_col] += monthly_buyback
+        for month in range(deal.start_month, min(deal.start_month + distribution_period, len(self.simulation_months))):
+            self.results.loc[month, vested_buybacks_col] += buyback_monthly_distribution_amt
             # self.results.loc[month, buyback_col] += monthly_buyback
             # self.results.loc[month, buyback_reduction_col] += monthly_buyback
+        ##########################################################
         
         # Process inflationary emissions related to a deal
-        for month in self.months[deal.start_month:]:
+        for month in self.simulation_months[deal.start_month:]:
             months_since_deal = month - deal.start_month
             
             # R(t) = delta * V * f(g) * exp(-Beta * (t-t_0))
@@ -215,10 +229,10 @@ class TitanTokenSimulation:
                 np.exp(-self.config.beta * months_since_deal)
             )
             
-            self.results.loc[month, deal_col] += emission_rate
+            self.results.loc[month, deal_inflationary_rewards_emissions] += emission_rate
             
         # Update total emissions by adding this deal's contributions
-        self.results[total_emissions_col] += self.results[deal_col] #+ self.results[vested_buybacks_col]
+        self.results[total_emissions_col] += self.results[deal_inflationary_rewards_emissions] #+ self.results[vested_buybacks_col]
     
     def _process_validator_rewards(self) -> None:
         """
@@ -240,13 +254,13 @@ class TitanTokenSimulation:
         initial_rate = self.config.validator_total_rewards * decay_constant
         
         # Calculate emissions for each month
-        for month in self.months:
+        for month in self.simulation_months:
             emission_rate = initial_rate * np.exp(-decay_constant * month)
             self.results.loc[month, validator_col] = emission_rate
             
         # Update total emissions
-        if 'total_emissions' in self.results.columns:
-            self.results['total_emissions'] += self.results[validator_col]
+        if 'total_dynamic_emissions' in self.results.columns:
+            self.results['total_dynamic_emissions'] += self.results[validator_col]
     
     def _calculate_totals(self) -> None:
         """Calculate cumulative emissions and total supply."""
@@ -260,7 +274,7 @@ class TitanTokenSimulation:
         # Note: total_emissions column already contains deal_emissions + buybacks
         self.results['total_emissions'] = (
             self.results['total_fixed_emissions'] + 
-            self.results['total_emissions']
+            self.results['total_dynamic_emissions']
         )
         
         # Calculate cumulative total emissions
@@ -280,9 +294,6 @@ class TitanTokenSimulation:
         )
         
         # Handle locking if configured
-        if self.config.locking_vector is not None:
-            self.results['locked_supply'] = self.config.locking_vector
-            self.results['unlocked_supply'] = self.results['circulating_supply'] - self.results['locked_supply']
-            # Update circulating supply to reflect locked tokens
-            self.results['circulating_supply'] = self.results['unlocked_supply']
+        self.results['locked_supply'] = self.config.locking_vector
+        self.results['circulating_supply'] -= self.results['locked_supply']
     
