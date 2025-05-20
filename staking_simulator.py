@@ -2,7 +2,7 @@ import streamlit as st
 import altair as alt
 import pandas as pd
 import numpy as np
-from core_sim import simulate_apy_monthly
+from core_sim import simulate_apy_monthly, STATIC_RELEASE_BUCKETS, convert_quarterly_to_monthly
 # Set the page to wide mode
 st.set_page_config(layout="wide", page_title="Staking Reward Simulator")
 
@@ -58,10 +58,10 @@ total_supply = st.sidebar.number_input("Total Supply",
                                        step=100000000,
                                        format="%d")
 
-staking_reward_amt = st.sidebar.number_input("Staking Reward Amount", 
+staking_reward_amt = st.sidebar.number_input("Total Staking Reward Pool Size", 
                                              min_value=100000000, 
                                              max_value=1000000000, 
-                                             value=600000000, 
+                                             value=200000000, 
                                              step=50000000,
                                              format="%d")
 
@@ -69,6 +69,7 @@ staking_reward_timeline_yrs = st.sidebar.slider("Staking Reward Timeline (years)
                                                min_value=5, 
                                                max_value=20, 
                                                value=10)
+
 # Run simulations and display results in the simulation tab
 seed = st.sidebar.number_input("Base Random Seed", 
                               min_value=1, 
@@ -141,52 +142,23 @@ num_simulations_per_trajectory = st.sidebar.slider("Simulations per Trajectory (
                                    value=10,
                                    help="Number of simulations to run for each trajectory type. Results shown are medians over these runs.")
 
-# Move the monthly schedule configuration to the config tab
 # Calculate total months
 total_months = staking_reward_timeline_yrs * 12
 
-# Prepare default cs_pct_by_month using quarterly data
-# Raw quarterly data (as percentages)
-quarterly_cs_pct = [
-    1.76, 3.48, 6.71, 9.19, 
-    16.62, 24.06, 30.74, 34.80, 
-    38.86, 42.92, 46.97, 51.03,
-    55.09, 59.15, 62.93, 66.15, 
-    69.38, 72.60, 75.10, 76.14, 
-    77.18, 78.21, 79.25, 80.29,
-    81.33, 82.37, 83.41, 84.45,
-    85.49, 86.53, 87.57, 88.61,
-    89.65, 90.69, 91.73, 92.77,
-    93.81, 96, 98, 100
-]
+# Initialize session state variables
+if 'static_release_schedule' not in st.session_state:
+    st.session_state.static_release_schedule = STATIC_RELEASE_BUCKETS.copy()
 
-# Convert percentages to decimals
-quarterly_cs_pct = [x/100 for x in quarterly_cs_pct]
+if 'dynamic_params' not in st.session_state:
+    st.session_state.dynamic_params = {
+        'monthly_revenue': 1000000,  # Default $1M monthly revenue
+        'token_price': 1.0,  # Default $1 token price
+        'delta': 0.1  # Default 10% delta
+    }
 
-# Calculate number of quarters in the simulation
-total_quarters = staking_reward_timeline_yrs * 4
+if 'target_staking_pct' not in st.session_state:
+    st.session_state.target_staking_pct = [0.2] * (staking_reward_timeline_yrs * 12)  # Default 20% for all months
 
-# If simulation is longer than our data, extend the last value
-if total_quarters > len(quarterly_cs_pct):
-    quarterly_cs_pct.extend([quarterly_cs_pct[-1]] * (total_quarters - len(quarterly_cs_pct)))
-
-# Create monthly values by interpolating between quarters
-default_cs_pct_list = []
-for q in range(total_quarters):
-    if q < len(quarterly_cs_pct) - 1:
-        # Interpolate between current quarter and next quarter
-        current_q = quarterly_cs_pct[q]
-        next_q = quarterly_cs_pct[q + 1]
-        # Create 3 monthly values between quarters
-        for m in range(3):
-            # Linear interpolation
-            month_value = current_q + (next_q - current_q) * (m / 3)
-            default_cs_pct_list.append(month_value)
-    else:
-        # For the last quarter, use the last value for all months
-        default_cs_pct_list.extend([quarterly_cs_pct[-1]] * 3)
-
-# Initialize session state for airdrop schedule if not exists
 if 'airdrop_schedule' not in st.session_state:
     # Default even distribution
     default_airdrop_value_per_year = 1000000
@@ -196,20 +168,110 @@ if 'airdrop_schedule' not in st.session_state:
         default_airdrop_list.extend([monthly_airdrop] * 12)
     st.session_state.airdrop_schedule = default_airdrop_list
 
-# Initialize session state for circulating supply if not exists
-if 'circulating_supply' not in st.session_state:
-    st.session_state.circulating_supply = default_cs_pct_list
-
-# Initialize session state for target staking percentage if not exists
-if 'target_staking_pct' not in st.session_state:
-    # Default to 0.2 (20%) for all months
-    st.session_state.target_staking_pct = [0.2] * total_months
-
 with config_tab:
     st.header("Configuration")
     
-    # Add airdrop scheduling section
-    st.subheader("Airdrop Schedule Configuration")
+    # Step 1: Static Release Schedule Section
+    st.subheader("1. Static Release Schedule")
+    st.write("Configure the quarterly release schedule for each bucket. Values are cumulative.")
+    
+    # Create a DataFrame for the static release schedule
+    quarters = [f"Q{i+1}" for i in range(23)]  # 23 quarters
+    static_release_data = {bucket: values for bucket, values in st.session_state.static_release_schedule.items()}
+    static_release_df = pd.DataFrame(static_release_data, index=quarters)
+    
+    # Display editable table
+    edited_static_release_df = st.data_editor(
+        static_release_df,
+        key="static_release_editor",
+        num_rows="fixed",
+        use_container_width=True,
+        column_config={
+            col: st.column_config.NumberColumn(
+                col,
+                help=f"Cumulative tokens released for {col}",
+                min_value=0,
+                step=1000000,
+                format="%d"
+            ) for col in static_release_df.columns
+        }
+    )
+    
+    # Update session state with edited values
+    st.session_state.static_release_schedule = edited_static_release_df.to_dict()
+    
+    # Add monthly breakdown display
+    st.subheader("Monthly Release Schedule")
+    st.write("This table shows the monthly token releases for each bucket (calculated from quarterly values).")
+    
+    # Calculate monthly values for each bucket
+    monthly_release_data = {}
+    for bucket, quarterly_values in st.session_state.static_release_schedule.items():
+        quarterly_values_list = list(quarterly_values.values())
+        monthly_values = convert_quarterly_to_monthly(quarterly_values_list, len(quarterly_values_list) * 3)
+        monthly_release_data[bucket] = monthly_values
+    
+    # Create DataFrame for monthly values
+    months = [f"Month {i+1}" for i in range(len(next(iter(monthly_release_data.values()))))]
+    monthly_release_df = pd.DataFrame(monthly_release_data, index=months)
+    
+    # Display monthly breakdown
+    st.dataframe(
+        monthly_release_df,
+        use_container_width=True,
+        column_config={
+            col: st.column_config.NumberColumn(
+                col,
+                help=f"Monthly tokens released for {col}",
+                format="%d"
+            ) for col in monthly_release_df.columns
+        }
+    )
+    
+    # Step 2: Dynamic Components Section
+    st.subheader("2. Deal Rewards Configuration")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        monthly_revenue = st.number_input(
+            "Monthly Revenue Target (USD)",
+            min_value=0,
+            value=st.session_state.dynamic_params['monthly_revenue'],
+            step=100000,
+            format="%d",
+            help="Target monthly revenue in USD"
+        )
+    
+    with col2:
+        token_price = st.number_input(
+            "Token Price (USD)",
+            min_value=0.01,
+            value=st.session_state.dynamic_params['token_price'],
+            step=0.01,
+            format="%.2f",
+            help="Current token price in USD"
+        )
+    
+    with col3:
+        delta = st.slider(
+            "Delta Parameter",
+            min_value=0.01,
+            max_value=1.0,
+            value=st.session_state.dynamic_params['delta'],
+            step=0.01,
+            help="Sensitivity to revenue changes (higher = more rewards)"
+        )
+    
+    # Update session state with dynamic parameters
+    st.session_state.dynamic_params = {
+        'monthly_revenue': monthly_revenue,
+        'token_price': token_price,
+        'delta': delta
+    }
+    
+    # Step 3: Airdrop Configuration
+    st.subheader("3. Validator Airdrop Configuration")
     col1, col2 = st.columns(2)
     
     with col1:
@@ -319,50 +381,50 @@ with config_tab:
         airdrop_schedule = calculate_airdrop_schedule()
         # Update the session state with the new schedule
         st.session_state.airdrop_schedule = airdrop_schedule.tolist()
+        st.success("Airdrop schedule generated successfully!")
     
-    st.subheader("Monthly Schedule Configuration")
-    st.write("Configure the circulating supply percentage, target staking percentage, and airdrop amounts for each month of the simulation.")
-
+    # Step 4: Monthly Configuration
+    st.subheader("4. Monthly Configuration")
+    st.write("Configure the target staking percentage for each month and view the airdrop schedule.")
+    
+    # Create monthly configuration DataFrame
     monthly_config_df_data = {
         "Month": list(range(1, total_months + 1)),
-        "Year": [(m-1) // 12 + 1 for m in range(1, total_months + 1)],
-        "Circulating Supply %": st.session_state.circulating_supply,
         "Target Staking %": st.session_state.target_staking_pct,
-        "Airdrop Amount (Tokens)": st.session_state.airdrop_schedule
     }
+    
+    # Add airdrop amounts if they exist
+    if 'airdrop_schedule' in st.session_state:
+        monthly_config_df_data["Airdrop Amount"] = st.session_state.airdrop_schedule
+    
+    # Create the DataFrame
     monthly_df_for_editing = pd.DataFrame(monthly_config_df_data)
-
-    st.caption("Edit Circulating Supply %, Target Staking %, and Airdrop Amounts per month:")
+    
+    st.caption("Edit Target Staking % per month and view Airdrop Amounts:")
     edited_monthly_config_df = st.data_editor(
         monthly_df_for_editing,
-        key=f"monthly_config_editor_{staking_reward_timeline_yrs}", # Ensures re-initialization if timeline changes
-        num_rows="fixed", # Rows are fixed by the DataFrame length
-        height=800, # Fixed large height to show more rows
-        use_container_width=True, # Use full width of container
+        key="monthly_config_editor",
+        num_rows="fixed",
+        height=400,
+        use_container_width=True,
         column_config={
-            "Month": st.column_config.NumberColumn("Month", disabled=True),
-            "Year": st.column_config.NumberColumn("Year", disabled=True),
-            "Circulating Supply %": st.column_config.NumberColumn(
-                "CS %",
-                help="Percentage of total supply circulating each month (0.0 to 1.0).",
-                min_value=0.0,
-                max_value=1.0,
-                step=0.01,
-                format="%.2f",
+            "Month": st.column_config.NumberColumn(
+                "Month",
+                disabled=True,
+                format="%d"
             ),
             "Target Staking %": st.column_config.NumberColumn(
-                "Target %",
+                "Target Staking %",
                 help="Target staking percentage for each month (0.0 to 1.0).",
                 min_value=0.0,
                 max_value=1.0,
                 step=0.01,
                 format="%.2f",
             ),
-            "Airdrop Amount (Tokens)": st.column_config.NumberColumn(
-                "Airdrop",
-                help="Airdrop amount in tokens for each month.",
-                min_value=0,
-                step=10000,
+            "Airdrop Amount": st.column_config.NumberColumn(
+                "Airdrop Amount",
+                help="Monthly airdrop amount in tokens (generated from airdrop configuration).",
+                disabled=True,
                 format="%d"
             )
         },
@@ -370,47 +432,45 @@ with config_tab:
     )
     
     # Update session state with edited values
-    st.session_state.airdrop_schedule = edited_monthly_config_df["Airdrop Amount (Tokens)"].tolist()
-    st.session_state.circulating_supply = edited_monthly_config_df["Circulating Supply %"].tolist()
     st.session_state.target_staking_pct = edited_monthly_config_df["Target Staking %"].tolist()
-
-with simulation_tab:
-    if st.button("Run Simulations"):
-        st.header("Median Simulation Results by Trajectory")
+    
+    # Run simulation automatically after configuration
+    if st.button("Run Simulation with Current Configuration"):
+        st.session_state.simulation_results = None  # Clear previous results
         
         all_median_results_list = []
         trajectory_types = ["Flat", "Increasing", "Decreasing"]
-        # trajectory_types = ["Flat"]
         increase_rate_decimal = increasing_rate_pct_yr / 100.0
         decrease_rate_decimal = decreasing_rate_pct_yr / 100.0
 
         for trajectory_name in trajectory_types:
             current_trajectory_runs_dfs = [] 
             
-            # Get the lists from the edited DataFrame
-            cs_pct_list_from_editor = edited_monthly_config_df["Circulating Supply %"].tolist()
-            airdrop_list_from_editor = edited_monthly_config_df["Airdrop Amount (Tokens)"].tolist()
+            # Get the target staking percentages from the edited DataFrame
             target_staking_list_from_editor = edited_monthly_config_df["Target Staking %"].tolist()
 
             for i in range(num_simulations_per_trajectory):
                 current_run_seed = seed + i 
                 
-                sim_df = simulate_apy_monthly(
+                sim_results = simulate_apy_monthly(
                     total_supply=total_supply,
                     staking_reward_amt=staking_reward_amt,
                     staking_reward_timeline_yrs=staking_reward_timeline_yrs,
                     seed=current_run_seed,
                     initial_stake_pct_mean=initial_stake_pct_mean,
-                    trajectory_type=trajectory_name.lower(), # "flat", "increasing", "decreasing"
+                    trajectory_type=trajectory_name.lower(),
                     increasing_rate=increase_rate_decimal,
                     decreasing_rate=decrease_rate_decimal,
                     stake_pct_trajectory_std=stake_pct_trajectory_std,
                     max_apy=max_apy,
-                    target_lock_pct_by_mo_input=target_staking_list_from_editor, # Pass the monthly target values
-                    f_sigma=f_sigma, 
-                    cs_pct_by_mo_input=cs_pct_list_from_editor,
-                    airdrop_by_mo_input=airdrop_list_from_editor
+                    target_lock_pct_by_mo_input=target_staking_list_from_editor,
+                    f_sigma=f_sigma,
+                    static_release_schedule=st.session_state.static_release_schedule,
+                    dynamic_params=st.session_state.dynamic_params,
+                    airdrop_schedule=st.session_state.airdrop_schedule
                 )
+                # Unpack the tuple into results_df and supply_breakdown_df
+                sim_df, _ = sim_results
                 current_trajectory_runs_dfs.append(sim_df)
             
             if current_trajectory_runs_dfs:
@@ -422,194 +482,229 @@ with simulation_tab:
                 # Add target staking percentage to each trajectory's DataFrame
                 median_df_for_trajectory['Target Staking %'] = edited_monthly_config_df['Target Staking %'].values
                 all_median_results_list.append(median_df_for_trajectory)
-                
+        
         if all_median_results_list:
             combined_median_results_df = pd.concat(all_median_results_list)
+            st.session_state.simulation_results = combined_median_results_df
+            st.success("Simulation completed! Switch to the 'APY Simulation' tab to view the results.")
         else:
-            st.write("No simulation data generated. Adjust parameters and try again.")
-            combined_median_results_df = pd.DataFrame() 
+            st.error("No simulation data generated. Please check your configuration.")
 
-        if not combined_median_results_df.empty:
-            # Create two rows of plots
-            staking_row1, staking_row2 = st.columns(2)
-            
-            with staking_row1:
-                st.subheader("Median Staking Percentage")
-                # Create base chart for staking percentage
-                base_staking_chart = alt.Chart(combined_median_results_df).encode(
-                    x=alt.X('Month:Q', title='Month'),
-                    y=alt.Y('Staked Percentage:Q', title='Median Staking Percentage', axis=alt.Axis(format='%')),
-                )
-                
-                # Add trajectory lines
-                trajectory_lines = base_staking_chart.mark_line(strokeDash=[5,5]).encode(
-                    color=alt.Color('Trajectory Type:N', title='Trajectory Type')
-                )
-                
-                # Add target line
-                target_line = base_staking_chart.mark_line(
-                    color='black',
-                    strokeDash=[2,2]
-                ).encode(
-                    y=alt.Y('Target Staking %:Q', title='Median Staking Percentage', axis=alt.Axis(format='%'))
-                )
-                
-                # Combine the charts
-                staking_chart = (trajectory_lines + target_line).properties(
-                    width='container',
-                    height=300
-                ).interactive()
-                
-                st.altair_chart(staking_chart, use_container_width=True)
-                
-                # Add legend explanation
-                st.caption("""
-                **Chart Legend:**
-                - Colored dashed lines: Median staking percentage for each trajectory type
-                - Black dashed line: Target staking percentage
-                """)
-
-            with staking_row2:
-                st.subheader("Supply Chart (Log Scale)")
-                # Create base chart for staked amount
-                base_staked_chart = alt.Chart(combined_median_results_df).encode(
-                    x=alt.X('Month:Q', title='Month'),
-                    y=alt.Y('Staked Amount (M):Q', 
-                           title='Amount (M-Tokens)', 
-                           scale=alt.Scale(type='log')),
-                )
-                
-                # Add trajectory lines
-                staked_amount_lines = base_staked_chart.mark_line(strokeDash=[5,5]).encode(
-                    color=alt.Color('Trajectory Type:N', title='Trajectory Type')
-                )
-                
-                # Add circulating supply line
-                circulating_supply_line = base_staked_chart.mark_line(
-                    color='black',
-                    strokeDash=[2,2]
-                ).encode(
-                    y=alt.Y('Circulating Supply (M):Q', 
-                           title='Amount (M-Tokens)',
-                           scale=alt.Scale(type='log'))
-                )
-                
-                # Add target staked amount line
-                target_staked_line = base_staked_chart.mark_line(
-                    color='gray',
-                    strokeDash=[3,3]
-                ).encode(
-                    y=alt.Y('Target Staked Amount (M):Q', 
-                           title='Amount (M-Tokens)',
-                           scale=alt.Scale(type='log'))
-                )
-                
-                # Combine the charts
-                staked_amount_chart = (staked_amount_lines + circulating_supply_line + target_staked_line).properties(
-                    width='container',
-                    height=300
-                ).interactive()
-                
-                st.altair_chart(staked_amount_chart, use_container_width=True)
-                st.caption("""
-                **Chart Legend:**
-                - Colored dashed lines: Median staked amount for each trajectory type
-                - Black dashed line: Circulating supply amount
-                - Gray dashed line: Target staked amount
-                - Note: Y-axis is logarithmic scale
-                """)
-
-            # Create APY plots side by side
-            apy_col1, apy_col2 = st.columns(2)
-            
-            # Calculate shared y-scale for APY plots
-            max_apy = max(
-                combined_median_results_df['APY with Airdrop'].max(),
-                combined_median_results_df['APY without Airdrop'].max()
-            )
-            min_apy = min(
-                combined_median_results_df['APY with Airdrop'].min(),
-                combined_median_results_df['APY without Airdrop'].min()
-            )
-            
-            with apy_col1:
-                st.subheader("Validator APY with Airdrop")
-                apy_with_chart = alt.Chart(combined_median_results_df).mark_line().encode(
-                    x=alt.X('Month:Q', title='Month'),
-                    y=alt.Y('APY with Airdrop:Q', 
-                           title='Validator APY', 
-                           axis=alt.Axis(format='%'),
-                           scale=alt.Scale(domain=[min_apy, max_apy])),
-                    color=alt.Color('Trajectory Type:N', title='Trajectory Type')
-                ).properties(
-                    width='container',
-                    height=300
-                ).interactive()
-                st.altair_chart(apy_with_chart, use_container_width=True)
-            
-            with apy_col2:
-                st.subheader("Validator APY without Airdrop")
-                apy_without_chart = alt.Chart(combined_median_results_df).mark_line().encode(
-                    x=alt.X('Month:Q', title='Month'),
-                    y=alt.Y('APY without Airdrop:Q', 
-                           title='Validator APY', 
-                           axis=alt.Axis(format='%'),
-                           scale=alt.Scale(domain=[min_apy, max_apy])),
-                    color=alt.Color('Trajectory Type:N', title='Trajectory Type')
-                ).properties(
-                    width='container',
-                    height=300
-                ).interactive()
-                st.altair_chart(apy_without_chart, use_container_width=True)
-
-            # Create two columns for the remaining plots
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Median Validator Rewards Distributed")
-                rewards_dist_chart = alt.Chart(combined_median_results_df).mark_line().encode(
-                    x=alt.X('Month:Q', title='Month'),
-                    y=alt.Y('Validator Rewards Distributed (M):Q', title='Median Rewards Distributed (M-Tokens)'),
-                    color=alt.Color('Trajectory Type:N', title='Trajectory Type')
-                ).properties(
-                    width='container',
-                    height=300
-                ).interactive()
-                st.altair_chart(rewards_dist_chart, use_container_width=True)
-                
-            with col2:
-                st.subheader("Median Validator Reward Pot")
-                reward_pot_chart = alt.Chart(combined_median_results_df).mark_line().encode(
-                    x=alt.X('Month:Q', title='Month'),
-                    y=alt.Y('Validator Reward Pot (M):Q', title='Median Pot Size (M-Tokens)'),
-                    color=alt.Color('Trajectory Type:N', title='Trajectory Type')
-                ).properties(
-                    width='container',
-                    height=300
-                ).interactive()
-                st.altair_chart(reward_pot_chart, use_container_width=True)
-            
-            # Add cumulative rewards at the bottom
-            st.subheader("Median Cumulative Validator Rewards")
-            cumulative_chart = alt.Chart(combined_median_results_df).mark_line().encode(
+with simulation_tab:
+    if 'simulation_results' in st.session_state and st.session_state.simulation_results is not None:
+        st.header("Median Simulation Results by Trajectory")
+        combined_median_results_df = st.session_state.simulation_results
+        
+        # Create two rows of plots
+        staking_row1, staking_row2 = st.columns(2)
+        
+        with staking_row1:
+            st.subheader("Median Staking Percentage")
+            # Create base chart for staking percentage
+            base_staking_chart = alt.Chart(combined_median_results_df).encode(
                 x=alt.X('Month:Q', title='Month'),
-                y=alt.Y('Cumulative Validator Rewards (M):Q', title='Median Cumulative Rewards (M-Tokens)'),
+                y=alt.Y('Staked Percentage:Q', title='Median Staking Percentage', axis=alt.Axis(format='%')),
+            )
+            
+            # Add trajectory lines
+            trajectory_lines = base_staking_chart.mark_line(strokeDash=[5,5]).encode(
+                color=alt.Color('Trajectory Type:N', title='Trajectory Type')
+            )
+            
+            # Add target line
+            target_line = base_staking_chart.mark_line(
+                color='black',
+                strokeDash=[2,2]
+            ).encode(
+                y=alt.Y('Target Staking %:Q', title='Median Staking Percentage', axis=alt.Axis(format='%'))
+            )
+            
+            # Combine the charts
+            staking_chart = (trajectory_lines + target_line).properties(
+                width='container',
+                height=300
+            ).interactive()
+            
+            st.altair_chart(staking_chart, use_container_width=True)
+            
+            # Add legend explanation
+            st.caption("""
+            **Chart Legend:**
+            - Colored dashed lines: Median staking percentage for each trajectory type
+            - Black dashed line: Target staking percentage
+            """)
+
+        with staking_row2:
+            st.subheader("Supply Chart (Log Scale)")
+            # Create base chart for staked amount
+            base_staked_chart = alt.Chart(combined_median_results_df).encode(
+                x=alt.X('Month:Q', title='Month'),
+                y=alt.Y('Staked Amount (M):Q', 
+                       title='Amount (M-Tokens)', 
+                       scale=alt.Scale(type='log')),
+            )
+            
+            # Add trajectory lines
+            staked_amount_lines = base_staked_chart.mark_line(strokeDash=[5,5]).encode(
+                color=alt.Color('Trajectory Type:N', title='Trajectory Type')
+            )
+            
+            # Add circulating supply line
+            circulating_supply_line = base_staked_chart.mark_line(
+                color='black',
+                strokeDash=[2,2]
+            ).encode(
+                y=alt.Y('Circulating Supply (M):Q', 
+                       title='Amount (M-Tokens)',
+                       scale=alt.Scale(type='log'))
+            )
+            
+            # Add target staked amount line
+            target_staked_line = base_staked_chart.mark_line(
+                color='gray',
+                strokeDash=[3,3]
+            ).encode(
+                y=alt.Y('Target Staked Amount (M):Q', 
+                       title='Amount (M-Tokens)',
+                       scale=alt.Scale(type='log'))
+            )
+            
+            # Combine the charts
+            staked_amount_chart = (staked_amount_lines + circulating_supply_line + target_staked_line).properties(
+                width='container',
+                height=300
+            ).interactive()
+            
+            st.altair_chart(staked_amount_chart, use_container_width=True)
+            st.caption("""
+            **Chart Legend:**
+            - Colored dashed lines: Median staked amount for each trajectory type
+            - Black dashed line: Circulating supply amount
+            - Gray dashed line: Target staked amount
+            - Note: Y-axis is logarithmic scale
+            """)
+
+        # Create APY plots side by side
+        apy_col1, apy_col2 = st.columns(2)
+        
+        # Calculate shared y-scale for APY plots
+        max_apy = max(
+            combined_median_results_df['APY with Airdrop'].max(),
+            combined_median_results_df['APY without Airdrop'].max()
+        )
+        min_apy = min(
+            combined_median_results_df['APY with Airdrop'].min(),
+            combined_median_results_df['APY without Airdrop'].min()
+        )
+        
+        with apy_col1:
+            st.subheader("Validator APY with Airdrop")
+            apy_with_chart = alt.Chart(combined_median_results_df).mark_line().encode(
+                x=alt.X('Month:Q', title='Month'),
+                y=alt.Y('APY with Airdrop:Q', 
+                       title='Validator APY', 
+                       axis=alt.Axis(format='%'),
+                       scale=alt.Scale(domain=[min_apy, max_apy])),
                 color=alt.Color('Trajectory Type:N', title='Trajectory Type')
             ).properties(
                 width='container',
                 height=300
             ).interactive()
-            st.altair_chart(cumulative_chart, use_container_width=True)
+            st.altair_chart(apy_with_chart, use_container_width=True)
+        
+        with apy_col2:
+            st.subheader("Validator APY without Airdrop")
+            apy_without_chart = alt.Chart(combined_median_results_df).mark_line().encode(
+                x=alt.X('Month:Q', title='Month'),
+                y=alt.Y('APY without Airdrop:Q', 
+                       title='Validator APY', 
+                       axis=alt.Axis(format='%'),
+                       scale=alt.Scale(domain=[min_apy, max_apy])),
+                color=alt.Color('Trajectory Type:N', title='Trajectory Type')
+            ).properties(
+                width='container',
+                height=300
+            ).interactive()
+            st.altair_chart(apy_without_chart, use_container_width=True)
+
+        # Create two columns for the remaining plots
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Median Validator Rewards Distributed")
+            rewards_dist_chart = alt.Chart(combined_median_results_df).mark_line().encode(
+                x=alt.X('Month:Q', title='Month'),
+                y=alt.Y('Validator Rewards Distributed (M):Q', title='Median Rewards Distributed (M-Tokens)'),
+                color=alt.Color('Trajectory Type:N', title='Trajectory Type')
+            ).properties(
+                width='container',
+                height=300
+            ).interactive()
+            st.altair_chart(rewards_dist_chart, use_container_width=True)
             
-            st.markdown("""
-            **Chart Legend:**
-            - Colors differentiate staking trajectory types (Flat, Increasing, Decreasing).
-            - **Median Staking Percentage**: Dashed lines (- - -) in its dedicated chart.
-            - **Median APY with Airdrop**: Solid lines (—) in the APY chart.
-            - **Median APY without Airdrop**: Dotted lines (···) in the APY chart.
-            
-            *All charts show median values over the specified number of simulations per trajectory.*
-            """)
-            
-            with st.expander("View Median Simulation Data by Trajectory"):
-                st.dataframe(combined_median_results_df)
+        with col2:
+            st.subheader("Median Validator Reward Pot")
+            reward_pot_chart = alt.Chart(combined_median_results_df).mark_line().encode(
+                x=alt.X('Month:Q', title='Month'),
+                y=alt.Y('Validator Reward Pot (M):Q', title='Median Pot Size (M-Tokens)'),
+                color=alt.Color('Trajectory Type:N', title='Trajectory Type')
+            ).properties(
+                width='container',
+                height=300
+            ).interactive()
+            st.altair_chart(reward_pot_chart, use_container_width=True)
+        
+        # Add cumulative rewards at the bottom
+        st.subheader("Median Cumulative Validator Rewards")
+        cumulative_chart = alt.Chart(combined_median_results_df).mark_line().encode(
+            x=alt.X('Month:Q', title='Month'),
+            y=alt.Y('Cumulative Validator Rewards (M):Q', title='Median Cumulative Rewards (M-Tokens)'),
+            color=alt.Color('Trajectory Type:N', title='Trajectory Type')
+        ).properties(
+            width='container',
+            height=300
+        ).interactive()
+        st.altair_chart(cumulative_chart, use_container_width=True)
+        
+        st.markdown("""
+        **Chart Legend:**
+        - Colors differentiate staking trajectory types (Flat, Increasing, Decreasing).
+        - **Median Staking Percentage**: Dashed lines (- - -) in its dedicated chart.
+        - **Median APY with Airdrop**: Solid lines (—) in the APY chart.
+        - **Median APY without Airdrop**: Dotted lines (···) in the APY chart.
+        
+        *All charts show median values over the specified number of simulations per trajectory.*
+        """)
+        
+        with st.expander("View Median Simulation Data by Trajectory"):
+            st.dataframe(combined_median_results_df)
+        
+        # Add supply breakdown table
+        st.subheader("Supply Breakdown")
+        st.write("This table shows the breakdown of supply components for each month:")
+        st.write("- Circulating Supply: Total supply in circulation")
+        st.write("- Staked Amount: Amount of tokens locked in staking")
+        st.write("- Validator Rewards: Rewards distributed to validators")
+        st.write("- Static Releases: Monthly releases from predefined buckets")
+        st.write("- Dynamic Rewards: Monthly rewards based on revenue")
+        st.write("- Airdrop Amount: Monthly airdrop distribution")
+        
+        # Get the supply breakdown from the first trajectory (they should be similar)
+        first_trajectory = trajectory_types[0]
+        first_trajectory_df = combined_median_results_df[combined_median_results_df['Trajectory Type'] == first_trajectory]
+        
+        # Create supply breakdown DataFrame
+        supply_breakdown_df = pd.DataFrame({
+            'Month': first_trajectory_df['Month'],
+            'Year': first_trajectory_df['Year'],
+            'Circulating Supply (M)': first_trajectory_df['Circulating Supply (M)'],
+            'Staked Amount (M)': first_trajectory_df['Staked Amount (M)'],
+            'Validator Rewards (M)': first_trajectory_df['Validator Rewards Distributed (M)'],
+            'Static Releases (M)': first_trajectory_df['Static Releases (M)'],
+            'Dynamic Rewards (M)': first_trajectory_df['Dynamic Rewards (M)'],
+            'Airdrop Amount (M)': first_trajectory_df['Airdrop Amount (M)']
+        })
+        
+        st.dataframe(supply_breakdown_df)
+    else:
+        st.info("Please complete the configuration and run the simulation to see results here.")
